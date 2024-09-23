@@ -28,8 +28,16 @@ class MainController {
   }
 
   static liveVideo(req, res) {
-    const { url, key_live } = req.body;
-    console.log('Streaming URL:', url);
+    let { url, key_live } = req.body;
+    let rtmpUrl = `${url}`;
+    if (!url.includes('rtmps://live-api-s.facebook.com:443/rtmp/')) {
+      return res.status(400).json({ error: 'Invalid streaming URL' });
+    }
+    if (url == 'rtmps://live-api-s.facebook.com:443/rtmp/' && !key_live) {
+      return res.status(400).json({ error: 'require key_live' });
+    }else {
+      rtmpUrl = `${url}/${key_live}`;
+    }
     const videoPath = 'F:\\tiktok-live-downloader\\downloads\\phuong.nga.0811-1531082092024.mp4';
 
     if (MainController.isStreaming) {
@@ -40,7 +48,6 @@ class MainController {
       return res.status(404).json({ error: 'Video file not found' });
     }
 
-    let rtmpUrl = `${url}/${key_live}`;
     
     MainController.isStreaming = true;
 
@@ -101,6 +108,7 @@ class MainController {
         if (MainController.ffmpegCommand) {
           MainController.ffmpegCommand.kill('SIGKILL');
           MainController.ffmpegCommand = null;
+          MainController.isStreaming = false;
           return res.json({ status: 'success', message: 'Live stream stopped' });
         } else {
           return res.status(400).json({ error: 'No active live stream to stop' });
