@@ -3,8 +3,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 
 class MainController {
-  static ffmpegCommand = null;
-  static isStreaming = false;
+  static streams = new Map();
 
   static getHome(req, res) {
     res.send("Hello World from MainController!");
@@ -28,32 +27,41 @@ class MainController {
   }
 
   static liveVideo(req, res) {
-    let { url, key_live } = req.body;
+    let { url, key_live, streamId, videoPath } = req.body;
     let rtmpUrl = `${url}`;
     if (!url.includes('rtmps://live-api-s.facebook.com:443/rtmp/')) {
       return res.status(400).json({ error: 'Invalid streaming URL' });
     }
-    if (url == 'rtmps://live-api-s.facebook.com:443/rtmp/' && !key_live) {
+    if (url === 'rtmps://live-api-s.facebook.com:443/rtmp/' && !key_live) {
       return res.status(400).json({ error: 'require key_live' });
-    }else {
+    } else {
       rtmpUrl = `${url}/${key_live}`;
     }
-    const videoPath = 'F:\\tiktok-live-downloader\\downloads\\phuong.nga.0811-1531082092024.mp4';
 
-    if (MainController.isStreaming) {
-      return res.status(400).json({ error: 'A stream is already in progress' });
+    if (!streamId && key_live) {
+      const regex = /^FB-(\d+)-/;
+
+      const match = key_live.match(regex);
+
+      if (match) {
+          streamId = match[1];
+          console.log(streamId);
+      } else {
+          console.log("ID không hợp lệ");
+      }
+    }
+
+    if (MainController.streams.has(streamId)) {
+      return res.status(400).json({ error: 'A stream with this ID is already in progress' });
     }
 
     if (!fs.existsSync(videoPath)) {
       return res.status(404).json({ error: 'Video file not found' });
     }
 
-    
-    MainController.isStreaming = true;
-
-    const streamVideo = () => {
-      MainController.ffmpegCommand = ffmpeg(videoPath)
-        .inputOptions(['-stream_loop', '-1', '-re']) // Loop input infinitely and read at native framerate
+    const streamVideo = (streamId) => {
+      const ffmpegCommand = ffmpeg(videoPath)
+        .inputOptions(['-stream_loop', '-1', '-re'])
         .outputOptions([
           '-c:v libx264',
           '-preset ultrafast',
@@ -68,57 +76,184 @@ class MainController {
           '-f flv'
         ])
         .on('start', (commandLine) => {
-          console.log('Spawned FFmpeg with command:', commandLine);
+          console.log(`Stream ${streamId} started with command:`, commandLine);
         })
         .on('progress', (progress) => {
-          console.log('Processing:', progress.percent, '% done');
+          console.log(`Stream ${streamId} processing:`, progress.percent, '% done');
         })
         .on('error', (err, stdout, stderr) => {
-          console.error('Error during video streaming:', err);
+          console.error(`Error in stream ${streamId}:`, err);
           console.error('FFmpeg stdout:', stdout);
           console.error('FFmpeg stderr:', stderr);
-          if (MainController.isStreaming) {
-            console.log('Restarting stream due to error...');
-            streamVideo(); // Restart the stream if it's still supposed to be streaming
+          if (MainController.streams.has(streamId) && !MainController.streams.get(streamId).stopping) {
+            console.log(`Restarting stream ${streamId} due to error...`);
+            setTimeout(() => streamVideo(streamId), 5000);
           }
         })
         .on('end', () => {
-          console.log('Video streaming ended, restarting...');
-          if (MainController.isStreaming) {
-            streamVideo(); // Restart the stream if it's still supposed to be streaming
+          console.log(`Stream ${streamId} ended`);
+          if (MainController.streams.has(streamId) && !MainController.streams.get(streamId).stopping) {
+            console.log(`Restarting stream ${streamId}...`);
+            setTimeout(() => streamVideo(streamId), 1000);
+          } else {
+            MainController.streams.delete(streamId);
           }
         });
 
-      MainController.ffmpegCommand.save(rtmpUrl);
+      ffmpegCommand.save(rtmpUrl);
+      MainController.streams.set(streamId, { command: ffmpegCommand, url: rtmpUrl, videoPath, stopping: false });
     };
 
-    streamVideo(); // Start the initial stream
+    streamVideo(streamId);
 
-    res.json({ status: 'success', message: 'Live stream started with auto-replay' });
+    res.json({ status: 'success', message: 'Live stream started with auto-replay', streamId });
   }
 
-  static async topLiveVideoToken(req, res) {
+  static async stopLiveVideoToken(req, res) {
     try {
-      // const { token, liveVideoID } = req.body;
-      // const apiUrl = `https://graph.facebook.com/v18.0/${liveVideoID}?end_live_video=true&access_token=${token}`;
-      // let response = await axios.post(apiUrl, {
-      //   params: { access_token: token}
-      // });
-      // if (response.status === 200) {
-        if (MainController.ffmpegCommand) {
-          MainController.ffmpegCommand.kill('SIGKILL');
-          MainController.ffmpegCommand = null;
-          MainController.isStreaming = false;
-          return res.json({ status: 'success', message: 'Live stream stopped' });
-        } else {
-          return res.status(400).json({ error: 'No active live stream to stop' });
-        }
-      // }
-      // return res.json(response.data);
+      const { streamId } = req.body;
+      if (!streamId) {
+        return res.status(400).json({ error: 'Stream ID is required' });
+      }
+
+      if (MainController.streams.has(streamId)) {
+        const streamData = MainController.streams.get(streamId);
+        streamData.stopping = true;
+        const { command } = streamData;
+        
+        command.kill('SIGINT');
+        
+        await new Promise((resolve) => {
+          const timeout = setTimeout(() => {
+            console.log(`Forcing termination of stream ${streamId}`);
+            command.kill('SIGKILL');
+            resolve();
+          }, 10000);
+
+          command.on('exit', () => {
+            console.log(`Stream ${streamId} has been terminated`);
+            clearTimeout(timeout);
+            resolve();
+          });
+        });
+
+        MainController.streams.delete(streamId);
+        console.log(MainController.streams);
+        
+        return res.json({ status: 'success', message: `Live stream ${streamId} stopped` });
+      } else {
+        return res.status(400).json({ error: `No active live stream found with ID ${streamId}` });
+      }
     } catch (error) {
-      console.error('Error ending live video:', error.response ? error.response.data : error.message);
-      return res.status(500).json({ error: 'Failed to end live video' });
+      console.error('Error ending live video:', error.message);
+      return res.status(500).json({ error: 'Failed to end live video', details: error.message });
     }
+  }
+
+  static async startMultipleStreams(req, res) {
+    const { streams } = req.body;
+    if (!Array.isArray(streams) || streams.length === 0) {
+      return res.status(400).json({ error: 'Invalid streams data' });
+    }
+
+    const results = [];
+    for (const stream of streams) {
+      try {
+        const { url, key_live, videoPath } = stream;
+        const streamId = Date.now().toString() + Math.random().toString(36).substr(2, 5);
+        const rtmpUrl = `${url}/${key_live}`;
+
+        if (!fs.existsSync(videoPath)) {
+          results.push({ streamId, status: 'error', message: 'Video file not found' });
+          continue;
+        }
+
+        const streamVideo = () => {
+          const ffmpegCommand = ffmpeg(videoPath)
+            .inputOptions(['-stream_loop', '-1', '-re'])
+            .outputOptions([
+              '-c:v libx264',
+              '-preset ultrafast',
+              '-tune zerolatency',
+              '-maxrate 2500k',
+              '-bufsize 5000k',
+              '-pix_fmt yuv420p',
+              '-g 60',
+              '-c:a aac',
+              '-b:a 128k',
+              '-ar 44100',
+              '-f flv'
+            ])
+            .on('start', (commandLine) => {
+              console.log(`Stream ${streamId} started with command:`, commandLine);
+            })
+            .on('error', (err) => {
+              console.error(`Error in stream ${streamId}:`, err);
+              if (MainController.streams.has(streamId)) {
+                console.log(`Restarting stream ${streamId} due to error...`);
+                setTimeout(() => streamVideo(streamId), 5000);
+              }
+            })
+            .on('end', () => {
+              console.log(`Stream ${streamId} ended, restarting...`);
+              if (MainController.streams.has(streamId)) {
+                setTimeout(() => streamVideo(streamId), 1000);
+              }
+            });
+
+          ffmpegCommand.save(rtmpUrl);
+          MainController.streams.set(streamId, { command: ffmpegCommand, url: rtmpUrl, videoPath });
+        };
+
+        streamVideo();
+        results.push({ streamId, status: 'success', message: 'Live stream started' });
+      } catch (error) {
+        console.error('Error starting stream:', error);
+        results.push({ status: 'error', message: error.message });
+      }
+    }
+
+    res.json({ results });
+  }
+
+  static async stopMultipleStreams(req, res) {
+    const { streamIds } = req.body;
+    if (!Array.isArray(streamIds) || streamIds.length === 0) {
+      return res.status(400).json({ error: 'Invalid stream IDs' });
+    }
+
+    const results = [];
+    for (const streamId of streamIds) {
+      try {
+        if (MainController.streams.has(streamId)) {
+          const { command } = MainController.streams.get(streamId);
+          command.kill('SIGINT');
+          
+          await new Promise((resolve) => {
+            command.on('exit', () => {
+              console.log(`Stream ${streamId} has been terminated`);
+              resolve();
+            });
+            
+            setTimeout(() => {
+              console.log(`Forcing termination of stream ${streamId}`);
+              command.kill('SIGKILL');
+              resolve();
+            }, 5000);
+          });
+
+          MainController.streams.delete(streamId);
+          results.push({ streamId, status: 'success', message: 'Live stream stopped' });
+        } else {
+          results.push({ streamId, status: 'error', message: 'No active live stream found with this ID' });
+        }
+      } catch (error) {
+        console.error(`Error stopping stream ${streamId}:`, error);
+        results.push({ streamId, status: 'error', message: error.message });
+      }
+    }
+
+    res.json({ results });
   }
 }
 
